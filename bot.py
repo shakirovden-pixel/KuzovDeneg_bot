@@ -9,18 +9,20 @@ from urllib.parse import quote
 from aiogram import Bot, Dispatcher, F
 from aiogram.types import Message
 from aiogram.filters import CommandStart
-from openai import OpenAI
+import google.generativeai as genai
 from dotenv import load_dotenv
 import os
 
 load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
-client = OpenAI(api_key=OPENAI_API_KEY)
+
+genai.configure(api_key=GEMINI_API_KEY)
+model = genai.GenerativeModel("gemini-1.5-flash")
 
 logging.basicConfig(level=logging.INFO)
 
@@ -40,7 +42,7 @@ SYSTEM_PROMPT = """
 - Примерное состояние
 - Примерный диапазон рыночной цены в России в рублях
 
-Ответь СТРОГО в формате JSON:
+Ответь СТРОГО в формате JSON (без markdown):
 
 {
   "brand": "Toyota",
@@ -113,35 +115,24 @@ async def handle_photo(message: Message):
     file = await bot.get_file(photo.file_id)
     photo_bytes = await bot.download_file(file.file_path)
 
-    buffered = BytesIO()
-    buffered.write(photo_bytes.read())
-    img_base64 = base64.b64encode(buffered.getvalue()).decode("utf-8")
+    image_data = photo_bytes.read()
 
     status = await message.answer("Анализирую фото... 🔍")
 
     try:
-        response = client.chat.completions.create(
-            model="gpt-4o",
-            messages=[
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "text", "text": "Определи автомобиль на фото:"},
-                        {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{img_base64}"}}
-                    ]
-                }
-            ],
-            max_tokens=600,
-            temperature=0.2
+        response = model.generate_content(
+            [
+                SYSTEM_PROMPT,
+                {"mime_type": "image/jpeg", "data": image_data}
+            ]
         )
 
-        raw = response.choices[0].message.content.strip()
+        raw = response.text.strip()
         raw = re.sub(r'^```json\s*|\s*```$', '', raw, flags=re.MULTILINE).strip()
         data = json.loads(raw)
 
         brand = data.get("brand", "Неизвестно")
-        model = data.get("model", "Неизвестно")
+        model_name = data.get("model", "Неизвестно")
         year_from = data.get("year_from")
         year_to = data.get("year_to")
         body = data.get("body", "—")
@@ -150,11 +141,11 @@ async def handle_photo(message: Message):
         price_to = data.get("price_to", 0)
         comment = data.get("comment", "")
 
-        links = make_search_links(brand, model, year_from, year_to)
+        links = make_search_links(brand, model_name, year_from, year_to)
         year_str = f"{year_from}–{year_to}" if year_from and year_to else "не определён"
 
         text = (
-            f"🚗 <b>{brand} {model}</b>\n"
+            f"🚗 <b>{brand} {model_name}</b>\n"
             f"📅 Год: {year_str}\n"
             f"🚙 Кузов: {body}\n"
             f"🔧 Состояние: {condition}\n\n"
