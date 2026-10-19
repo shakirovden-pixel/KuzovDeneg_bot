@@ -8,6 +8,7 @@ from aiogram.types import Message, CallbackQuery
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.utils.keyboard import InlineKeyboardBuilder
+from aiogram.client.default import DefaultBotProperties
 
 # Загружаем переменные окружения
 load_dotenv()
@@ -15,7 +16,6 @@ load_dotenv()
 # Получаем токен
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 
-# Проверка, что токен вообще есть
 if not BOT_TOKEN:
     raise ValueError("❌ Ошибка: переменная BOT_TOKEN не найдена! Добавьте её в настройках Railway или в файле .env")
 
@@ -191,12 +191,16 @@ async def process_photo(message: Message, state: FSMContext):
 async def main():
     logging.basicConfig(level=logging.INFO)
     
-    # Инициализируем бота с глобальным HTML-парсингом
-    bot = Bot(token=BOT_TOKEN, parse_mode="HTML")
+    # Инициализация бота с новым синтаксисом aiogram 3.7+
+    bot = Bot(
+        token=BOT_TOKEN, 
+        default=DefaultBotProperties(parse_mode="HTML")
+    )
+    
     dp = Dispatcher()
     dp.include_router(router)
     
-    # Удаляем вебхуки (важно для Railway, чтобы не было конфликтов с polling)
+    # Удаляем вебхуки (важно для Railway, чтобы не было конфликтов)
     await bot.delete_webhook(drop_pending_updates=True)
     
     print("🚀 Бот успешно запущен!")
