@@ -1,170 +1,191 @@
 import asyncio
 import logging
-import base64
-import json
-import re
-from io import BytesIO
-from urllib.parse import quote
-
-from aiogram import Bot, Dispatcher, F
-from aiogram.types import Message
-from aiogram.filters import CommandStart
-import google.generativeai as genai
-from dotenv import load_dotenv
 import os
+from aiogram import Bot, Dispatcher, F, Router
+from aiogram.filters import CommandStart, Command
+from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.utils.keyboard import InlineKeyboardBuilder
 
-load_dotenv()
+# --- НАСТРОЙКИ ---
+BOT_TOKEN = "ВАШ_ТОКЕН_ЗДЕСЬ"
 
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+router = Router()
 
-bot = Bot(token=BOT_TOKEN)
-dp = Dispatcher()
-
-genai.configure(api_key=GEMINI_API_KEY)
-model = genai.GenerativeModel("gemini-1.5-flash")
-
-logging.basicConfig(level=logging.INFO)
-
-PLATE_REGEX = re.compile(
-    r'^[АВЕКМНОРСТУХABEKMHOPCTYX]\d{3}[АВЕКМНОРСТУХABEKMHOPCTYX]{2}\d{2,3}$',
-    re.IGNORECASE
-)
-
-SYSTEM_PROMPT = """
-Ты — эксперт по автомобилям и российскому рынку (Auto.ru, Avito, Drom).
-
-По фото автомобиля определи:
-- Марку (brand) — на английском
-- Модель (model) — на английском
-- Примерный диапазон года выпуска (year_from и year_to)
-- Тип кузова
-- Примерное состояние
-- Примерный диапазон рыночной цены в России в рублях
-
-Ответь СТРОГО в формате JSON (без markdown):
-
-{
-  "brand": "Toyota",
-  "model": "Camry",
-  "year_from": 2018,
-  "year_to": 2020,
-  "body": "седан",
-  "condition": "хорошее",
-  "price_from": 1800000,
-  "price_to": 2300000,
-  "comment": "Краткий комментарий"
+# --- МОКОВЫЕ ДАННЫЕ (в будущем заменим на БД) ---
+USER_DATA = {
+    "balance": "1 250 000 ₽",
+    "invested": "1 000 000 ₽",
+    "income": "250 000 ₽",
+    "reward": "70 000 ₽",
 }
-"""
 
-def slugify(text: str) -> str:
-    text = text.lower().strip()
-    replacements = {
-        "лада": "lada", "ваз": "lada",
-        "mercedes-benz": "mercedes", "mercedes benz": "mercedes",
-        "bmw": "bmw", "volkswagen": "volkswagen", "vw": "volkswagen",
-    }
-    for rus, eng in replacements.items():
-        if rus in text:
-            text = text.replace(rus, eng)
-    text = re.sub(r'[^a-z0-9\s-]', '', text)
-    text = re.sub(r'\s+', '-', text)
-    return text
+DEALS = {
+    "1": {"name": "Toyota RAV4", "vin": "*******1234", "invested": "1 000 000 ₽", "income": "250 000 ₽", "status": "В продаже", "days": "12"},
+    "2": {"name": "BMW X5", "vin": "*******5678", "invested": "1 500 000 ₽", "income": "0 ₽", "status": "Подготовка", "days": "4"},
+    "3": {"name": "Hyundai Solaris", "vin": "*******9012", "invested": "800 000 ₽", "income": "0 ₽", "status": "Задержка", "days": "37"},
+}
 
-def make_search_links(brand: str, model: str, year_from=None, year_to=None) -> dict:
-    brand_slug = slugify(brand)
-    model_slug = slugify(model)
+# --- FSM ДЛЯ ДОБАВЛЕНИЯ РАСХОДА ---
+class AddExpense(StatesGroup):
+    choosing_car = State()
+    choosing_type = State()
+    entering_amount = State()
+    entering_comment = State()
+    attaching_photo = State()
 
-    autoru = f"https://auto.ru/cars/{brand_slug}/{model_slug}/all/"
-    if year_from and year_to:
-        autoru += f"?year_from={year_from}&year_to={year_to}"
+# --- КЛАВИАТУРЫ ---
 
-    query = f"{brand} {model}"
-    if year_from and year_to:
-        query += f" {year_from}-{year_to}"
-    avito = f"https://www.avito.ru/all/avtomobili?q={quote(query)}"
+def main_menu_kb():
+    builder = InlineKeyboardBuilder()
+    builder.row(InlineKeyboardButton(text="💰 Мой баланс", callback_data="menu_balance"))
+    builder.row(InlineKeyboardButton(text="🚗 Мои сделки", callback_data="menu_deals"))
+    builder.row(InlineKeyboardButton(text="📈 История операций", callback_data="menu_history"))
+    builder.row(InlineKeyboardButton(text="📊 Отчеты", callback_data="menu_reports"))
+    builder.row(InlineKeyboardButton(text="⚙️ Настройки", callback_data="menu_settings"))
+    return builder.as_markup()
 
-    drom = f"https://auto.drom.ru/{brand_slug}/{model_slug}/"
-    if year_from and year_to:
-        drom += f"?minyear={year_from}&maxyear={year_to}"
+def back_kb():
+    builder = InlineKeyboardBuilder()
+    builder.row(InlineKeyboardButton(text="🔙 В главное меню", callback_data="main_menu"))
+    return builder.as_markup()
 
-    return {"autoru": autoru, "avito": avito, "drom": drom}
+def deals_list_kb():
+    builder = InlineKeyboardBuilder()
+    for deal_id, deal in DEALS.items():
+        builder.row(InlineKeyboardButton(text=f"{deal['name']} — {deal['status']}", callback_data=f"deal_{deal_id}"))
+    builder.row(InlineKeyboardButton(text="🔙 В главное меню", callback_data="main_menu"))
+    return builder.as_markup()
 
-@dp.message(CommandStart())
-async def start(message: Message):
-    await message.answer(
-        "Привет! 👋\n\n"
-        "Пришли фото автомобиля или госномер (например А123ВС777).",
-        parse_mode="HTML"
+def deal_detail_kb(deal_id: str):
+    builder = InlineKeyboardBuilder()
+    builder.row(InlineKeyboardButton(text="➕ Добавить расход", callback_data=f"add_expense_{deal_id}"))
+    builder.row(InlineKeyboardButton(text="📄 Скачать отчет (PDF)", callback_data="download_pdf"))
+    builder.row(InlineKeyboardButton(text="🔙 Назад к сделкам", callback_data="menu_deals"))
+    return builder.as_markup()
+
+def expense_types_kb():
+    builder = InlineKeyboardBuilder()
+    builder.row(InlineKeyboardButton(text="🔧 Ремонт", callback_data="exp_repair"))
+    builder.row(InlineKeyboardButton(text="🧼 Мойка/Детейлинг", callback_data="exp_wash"))
+    builder.row(InlineKeyboardButton(text="📄 Страховка", callback_data="exp_insurance"))
+    builder.row(InlineKeyboardButton(text="❌ Отмена", callback_data="main_menu"))
+    return builder.as_markup()
+
+# --- ХЭНДЛЕРЫ ---
+
+@router.message(CommandStart())
+async def cmd_start(message: Message):
+    text = (
+        f"Привет, <b>{message.from_user.first_name}</b>! 👋\n"
+        "Добро пожаловать в <b>АвтоИнвест</b>!\n\n"
+        "Здесь вы можете управлять своими инвестициями, следить за сделками и получать отчеты."
+    )
+    await message.answer(text, reply_markup=main_menu_kb())
+
+@router.callback_query(F.data == "main_menu")
+async def show_main_menu(callback: CallbackQuery):
+    await callback.message.edit_text("Главное меню. Выберите действие:", reply_markup=main_menu_kb())
+
+@router.callback_query(F.data == "menu_balance")
+async def show_balance(callback: CallbackQuery):
+    text = (
+        "💰 <b>Ваш баланс</b>\n\n"
+        f"<b>{USER_DATA['balance']}</b>\n\n"
+        f"Вложено: {USER_DATA['invested']}\n"
+        f"Доход: {USER_DATA['income']}\n\n"
+        f"🎁 <b>Ваше вознаграждение</b>\n"
+        f"{USER_DATA['reward']} (7% от суммы вложения)"
+    )
+    await callback.message.edit_text(text, reply_markup=back_kb())
+
+@router.callback_query(F.data == "menu_deals")
+async def show_deals(callback: CallbackQuery):
+    await callback.message.edit_text(
+        "🚗 <b>Мои сделки</b>\n\nВыберите автомобиль для просмотра деталей:",
+        reply_markup=deals_list_kb()
     )
 
-@dp.message(F.text)
-async def handle_text(message: Message):
-    text = message.text.strip().replace(" ", "").upper()
-    if PLATE_REGEX.match(text):
-        await message.answer(
-            f"✅ Госномер принят: <b>{text}</b>\n\nТеперь пришли фото автомобиля.",
-            parse_mode="HTML"
-        )
+@router.callback_query(F.data.startswith("deal_"))
+async def show_deal_detail(callback: CallbackQuery):
+    deal_id = callback.data.split("_")[1]
+    deal = DEALS[deal_id]
+    
+    text = (
+        f"🚘 <b>{deal['name']}</b>\n"
+        f"VIN: {deal['vin']}\n\n"
+        f"<b>Финансовые показатели:</b>\n"
+        f"Цена покупки: {deal['invested']}\n"
+        f"Расходы: 120 000 ₽\n"
+        f"Цена продажи: 1 450 000 ₽\n"
+        f"Прибыль: {deal['income']}\n\n"
+        f"<b>Вознаграждение инвестора:</b>\n"
+        f"7% (первый месяц): 70 000 ₽\n"
+        f"Общее за цикл: 100 000 ₽"
+    )
+    await callback.message.edit_text(text, reply_markup=deal_detail_kb(deal_id))
+
+# --- ЛОГИКА ДОБАВЛЕНИЯ РАСХОДА (FSM) ---
+
+@router.callback_query(F.data.startswith("add_expense_"))
+async def start_add_expense(callback: CallbackQuery, state: FSMContext):
+    deal_id = callback.data.split("_")[2]
+    await state.update_data(deal_id=deal_id)
+    await callback.message.edit_text(
+        f"Добавление расхода для <b>{DEALS[deal_id]['name']}</b>.\n\nВыберите тип расхода:",
+        reply_markup=expense_types_kb()
+    )
+    await state.set_state(AddExpense.choosing_type)
+
+@router.callback_query(AddExpense.choosing_type, F.data.startswith("exp_"))
+async def process_expense_type(callback: CallbackQuery, state: FSMContext):
+    expense_type = callback.data.replace("exp_", "")
+    await state.update_data(exp_type=expense_type)
+    await callback.message.edit_text("Введите сумму расхода (в рублях, только цифры):")
+    await state.set_state(AddExpense.entering_amount)
+
+@router.message(AddExpense.entering_amount)
+async def process_amount(message: Message, state: FSMContext):
+    if not message.text.isdigit():
+        await message.answer("Пожалуйста, введите сумму цифрами (например: 25000).")
+        return
+    await state.update_data(amount=message.text)
+    await message.answer("Введите комментарий (например: Замена масла и фильтров):")
+    await state.set_state(AddExpense.entering_comment)
+
+@router.message(AddExpense.entering_comment)
+async def process_comment(message: Message, state: FSMContext):
+    await state.update_data(comment=message.text)
+    await message.answer("Прикрепите фото чека (или отправьте /skip, чтобы пропустить):")
+    await state.set_state(AddExpense.attaching_photo)
+
+@router.message(AddExpense.attaching_photo)
+async def process_photo(message: Message, state: FSMContext):
+    data = await state.get_data()
+    # Здесь мы бы сохранили данные в БД
+    text = (
+        "✅ <b>Расход успешно добавлен!</b>\n\n"
+        f"Автомобиль: {DEALS[data['deal_id']]['name']}\n"
+        f"Тип: {data['exp_type']}\n"
+        f"Сумма: {data['amount']} ₽\n"
+        f"Комментарий: {data['comment']}\n"
+    )
+    if message.photo:
+        text += "Фото: <i>Прикреплено</i>"
     else:
-        await message.answer("Пришли фото автомобиля или госномер.")
+        text += "Фото: <i>Нет</i>"
+        
+    await message.answer(text, reply_markup=back_kb())
+    await state.clear()
 
-@dp.message(F.photo)
-async def handle_photo(message: Message):
-    photo = message.photo[-1]
-    file = await bot.get_file(photo.file_id)
-    photo_bytes = await bot.download_file(file.file_path)
-
-    image_data = photo_bytes.read()
-
-    status = await message.answer("Анализирую фото... 🔍")
-
-    try:
-        response = model.generate_content(
-            [
-                SYSTEM_PROMPT,
-                {"mime_type": "image/jpeg", "data": image_data}
-            ]
-        )
-
-        raw = response.text.strip()
-        raw = re.sub(r'^```json\s*|\s*```$', '', raw, flags=re.MULTILINE).strip()
-        data = json.loads(raw)
-
-        brand = data.get("brand", "Неизвестно")
-        model_name = data.get("model", "Неизвестно")
-        year_from = data.get("year_from")
-        year_to = data.get("year_to")
-        body = data.get("body", "—")
-        condition = data.get("condition", "—")
-        price_from = data.get("price_from", 0)
-        price_to = data.get("price_to", 0)
-        comment = data.get("comment", "")
-
-        links = make_search_links(brand, model_name, year_from, year_to)
-        year_str = f"{year_from}–{year_to}" if year_from and year_to else "не определён"
-
-        text = (
-            f"🚗 <b>{brand} {model_name}</b>\n"
-            f"📅 Год: {year_str}\n"
-            f"🚙 Кузов: {body}\n"
-            f"🔧 Состояние: {condition}\n\n"
-            f"💰 <b>Примерная стоимость:</b>\n"
-            f"от <b>{price_from:,} ₽</b> до <b>{price_to:,} ₽</b>\n\n"
-            f"{comment}\n\n"
-            f"🔗 <b>Объявления:</b>\n"
-            f"• <a href=\"{links['autoru']}\">Auto.ru</a>\n"
-            f"• <a href=\"{links['avito']}\">Avito</a>\n"
-            f"• <a href=\"{links['drom']}\">Drom</a>"
-        )
-
-        await status.edit_text(text, parse_mode="HTML", disable_web_page_preview=True)
-
-    except Exception as e:
-        logging.exception(e)
-        await status.edit_text("Ошибка при анализе. Попробуй другое фото.")
-
+# --- ЗАПУСК ---
 async def main():
+    logging.basicConfig(level=logging.INFO)
+    bot = Bot(token=BOT_TOKEN)
+    dp = Dispatcher()
+    dp.include_router(router)
+    await bot.delete_webhook(drop_pending_updates=True)
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
