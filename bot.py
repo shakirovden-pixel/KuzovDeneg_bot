@@ -1,15 +1,23 @@
 import asyncio
 import logging
 import os
+from dotenv import load_dotenv
 from aiogram import Bot, Dispatcher, F, Router
-from aiogram.filters import CommandStart, Command
-from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.filters import CommandStart
+from aiogram.types import Message, CallbackQuery
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
-# --- НАСТРОЙКИ ---
-BOT_TOKEN = "ВАШ_ТОКЕН_ЗДЕСЬ"
+# Загружаем переменные окружения
+load_dotenv()
+
+# Получаем токен
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+
+# Проверка, что токен вообще есть
+if not BOT_TOKEN:
+    raise ValueError("❌ Ошибка: переменная BOT_TOKEN не найдена! Добавьте её в настройках Railway или в файле .env")
 
 router = Router()
 
@@ -29,7 +37,6 @@ DEALS = {
 
 # --- FSM ДЛЯ ДОБАВЛЕНИЯ РАСХОДА ---
 class AddExpense(StatesGroup):
-    choosing_car = State()
     choosing_type = State()
     entering_amount = State()
     entering_comment = State()
@@ -67,9 +74,9 @@ def deal_detail_kb(deal_id: str):
 
 def expense_types_kb():
     builder = InlineKeyboardBuilder()
-    builder.row(InlineKeyboardButton(text="🔧 Ремонт", callback_data="exp_repair"))
-    builder.row(InlineKeyboardButton(text="🧼 Мойка/Детейлинг", callback_data="exp_wash"))
-    builder.row(InlineKeyboardButton(text="📄 Страховка", callback_data="exp_insurance"))
+    builder.row(InlineKeyboardButton(text="🔧 Ремонт", callback_data="exp_Ремонт"))
+    builder.row(InlineKeyboardButton(text="🧼 Мойка/Детейлинг", callback_data="exp_Мойка"))
+    builder.row(InlineKeyboardButton(text="📄 Страховка", callback_data="exp_Страховка"))
     builder.row(InlineKeyboardButton(text="❌ Отмена", callback_data="main_menu"))
     return builder.as_markup()
 
@@ -157,13 +164,13 @@ async def process_amount(message: Message, state: FSMContext):
 @router.message(AddExpense.entering_comment)
 async def process_comment(message: Message, state: FSMContext):
     await state.update_data(comment=message.text)
-    await message.answer("Прикрепите фото чека (или отправьте /skip, чтобы пропустить):")
+    await message.answer("Прикрепите фото чека (или отправьте любой текст, чтобы пропустить):")
     await state.set_state(AddExpense.attaching_photo)
 
 @router.message(AddExpense.attaching_photo)
 async def process_photo(message: Message, state: FSMContext):
     data = await state.get_data()
-    # Здесь мы бы сохранили данные в БД
+    
     text = (
         "✅ <b>Расход успешно добавлен!</b>\n\n"
         f"Автомобиль: {DEALS[data['deal_id']]['name']}\n"
@@ -179,14 +186,24 @@ async def process_photo(message: Message, state: FSMContext):
     await message.answer(text, reply_markup=back_kb())
     await state.clear()
 
-# --- ЗАПУСК ---
+# --- ЗАПУСК БОТА ---
+
 async def main():
     logging.basicConfig(level=logging.INFO)
-    bot = Bot(token=BOT_TOKEN)
+    
+    # Инициализируем бота с глобальным HTML-парсингом
+    bot = Bot(token=BOT_TOKEN, parse_mode="HTML")
     dp = Dispatcher()
     dp.include_router(router)
+    
+    # Удаляем вебхуки (важно для Railway, чтобы не было конфликтов с polling)
     await bot.delete_webhook(drop_pending_updates=True)
+    
+    print("🚀 Бот успешно запущен!")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except (KeyboardInterrupt, SystemExit):
+        print("Бот остановлен")
